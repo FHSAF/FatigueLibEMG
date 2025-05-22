@@ -8,11 +8,13 @@ from collections import defaultdict, deque
 import logging
 import datetime
 import threading # For potential future scalability if needed
+import statistics # For mean calculation
 
 # --- Configuration ---
 KAFKA_BROKERS = ['192.168.50.105:9092', '192.168.50.105:9093', '192.168.50.105:9094']
 EMG_MDF_INPUT_TOPIC = "th_emg_for_mdf_processing" # Topic Flink sends specific muscle data to
 FATIGUE_ALERT_TOPIC = 'th_emg_mdf_fatigue_alerts' # Standardized alert topic name
+MDF_VISUALIZATION_TOPIC = 'th_emg_mdf_visualization_data' # NEW: Topic for individual MDF values
 CONSUMER_GROUP_ID = 'python-emg-mdf-processor-v4'
 
 SAMPLING_RATE_HZ = 100.0  # Hz - MUST match the source data rate
@@ -26,54 +28,42 @@ WINDOW_TYPE_WELCH = 'hann'
 # Optional Bandpass Pre-filtering settings
 FILTER_ORDER = 4
 LOWCUT_HZ = 20.0
-HIGHCUT_HZ = 40.0 # MDF for fatigue is expected in lower frequencies, but sEMG power goes higher.
-                 # Keep a reasonable upper range for general sEMG, Welch will focus on relevant bands.
-                 # The paper by Corvini & Conforto (sensors-22-06360) simulated fatigue with fh=40Hz.
-                 # Cifrek et al. (1-s2.0-S0268003309000254-main.pdf) uses a broader acquisition bandwidth for EMG.
-                 # If data from Flink is already well-filtered for the EMG signal itself (e.g. 20-450Hz),
-                 # this pre-filtering here might be redundant or could be narrowed.
-APPLY_PRE_FILTERING = False # Set to True to enable bandpass filtering here
+HIGHCUT_HZ = 40.0 
+APPLY_PRE_FILTERING = False
 
 TREND_WINDOW_SEC = 60
-MIN_MDF_POINTS_FOR_TREND = 10 # Minimum MDF values needed to attempt regression
-MDF_SLOPE_FATIGUE_THRESHOLD = -0.10 # Hz/sec - Highly sensitive, NEEDS CALIBRATION!
-REGRESSION_R_SQUARED_THRESHOLD = 0.25 # Min R^2 for trend significance - NEEDS CALIBRATION!
+MIN_MDF_POINTS_FOR_TREND = 10 
+MDF_SLOPE_FATIGUE_THRESHOLD = -0.10 
+REGRESSION_R_SQUARED_THRESHOLD = 0.25 
 ALERT_COOLDOWN_SEC = 60
 
-# This list is a safeguard if Flink somehow sends other muscles.
-# Primary filtering should happen in Flink before sending to EMG_MDF_INPUT_TOPIC.
 MUSCLES_TO_MONITOR_FOR_MDF = {
     "trapezius_right",
     "deltoids_right",
-    "latissimus_right" 
+    "latissimus_right" # Note: Ensure this matches what Flink sends. Often "latissimus_dorsi_right"
 }
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(name)s - %(module)s - %(message)s')
 logger = logging.getLogger(__name__)
 
 # --- State Management ---
-# Key: tuple (thingid, muscle_name)
-# Value: deque containing raw uV samples for Welch method input
-emg_sample_buffer = defaultdict(lambda: deque(maxlen=NPERSEG_WELCH)) # Buffer for one segment for Welch
-
-# Key: tuple (thingid, muscle_name)
-# Value: deque containing (timestamp_ms_of_mdf_calc, mdf_value)
-mdf_history = defaultdict(lambda: deque(maxlen=int(TREND_WINDOW_SEC * (1.0/FFT_WINDOW_SEC) * 2.5))) # *2.5 for safety margin
-
-last_alert_time_mdf = defaultdict(float) # Renamed to avoid conflict if combined with RMS script
+emg_sample_buffer = defaultdict(lambda: deque(maxlen=NPERSEG_WELCH)) 
+# mdf_history stores: (mdf_source_event_timestamp_ms, mdf_value, avg_flink_sent_ts_for_fft_window, avg_source_ts_in_current_fft_window)
+mdf_history = defaultdict(lambda: deque(maxlen=int(TREND_WINDOW_SEC * (1.0/FFT_WINDOW_SEC) * 2.5)))
+last_alert_time_mdf = defaultdict(float)
 
 # --- Helper Functions ---
 def butter_bandpass_filter(data, lowcut, highcut, fs, order=FILTER_ORDER):
     nyq = 0.5 * fs
     low = lowcut / nyq
     high = highcut / nyq
-    if high >= 1.0: high = 0.99 # Ensure high is less than 1.0 for nyquist
-    if low <= 0.0: low = 0.01  # Ensure low is greater than 0.0
+    if high >= 1.0: high = 0.99 
+    if low <= 0.0: low = 0.01  
     if low >= high:
         logger.warning(f"Lowcut {low*nyq}Hz is >= highcut {high*nyq}Hz. Skipping filter.")
         return data
     b, a = butter(order, [low, high], btype='band', analog=False)
-    y = filtfilt(b, a, data) # zero-phase filter
+    y = filtfilt(b, a, data) 
     return y
 
 def parse_timestamp_ms(data, field_name="sourceTimestampMs"):
@@ -92,7 +82,7 @@ def calculate_mdf_from_psd(frequencies, psd):
         logger.warning("Invalid input for MDF calculation from PSD.")
         return np.nan
     total_power = np.sum(psd)
-    if total_power < 1e-12: # Increased threshold slightly
+    if total_power < 1e-12: 
         logger.debug("Total power too low, cannot calculate MDF.")
         return np.nan
     cumulative_power = np.cumsum(psd)
@@ -100,7 +90,7 @@ def calculate_mdf_from_psd(frequencies, psd):
         median_freq_index = np.searchsorted(cumulative_power, total_power / 2.0, side='left')
         if median_freq_index >= len(frequencies):
             median_freq_index = len(frequencies) - 1
-        if median_freq_index < 0 : return np.nan # Should not happen
+        if median_freq_index < 0 : return np.nan
         return frequencies[median_freq_index]
     except IndexError:
         logger.warning("IndexError during MDF calculation from PSD.", exc_info=True)
@@ -131,7 +121,7 @@ def initialize_kafka_clients_mdf():
             producer = KafkaProducer(
                 bootstrap_servers=KAFKA_BROKERS,
                 value_serializer=lambda v: json.dumps(v).encode('utf-8'),
-                retries=3 # Producer internal retries
+                retries=3 
             )
             logger.info("Kafka Producer connected.")
             return True
@@ -144,9 +134,9 @@ def initialize_kafka_clients_mdf():
                 return False
         except Exception as e:
             logger.error(f"Failed to create Kafka clients (Attempt {attempt + 1}/{max_retries}): {e}", exc_info=True)
+            if consumer: consumer.close()
             return False
     return False
-
 
 # --- Main Processing Loop ---
 def process_emg_mdf_fatigue():
@@ -158,37 +148,52 @@ def process_emg_mdf_fatigue():
         while True:
             message_pack = consumer.poll(timeout_ms=1000)
             if not message_pack:
-                time.sleep(0.05) # Shorter sleep if no messages for responsiveness
+                time.sleep(0.05) 
                 continue
 
             for tp, records in message_pack.items():
                 for record in records:
                     try:
                         data = record.value
-                        logger.debug(f"Received msg on {tp}: {data}")
+                        python_receipt_timestamp_ms = int(time.time() * 1000) # For internal Python processing delay if needed
+                        logger.debug(f"Received msg on {tp.topic}: {data}")
 
                         thingid = data.get("thingid")
-                        timestamp_ms = parse_timestamp_ms(data) # Uses "timestamp_ms" field
+                        source_timestamp_ms = parse_timestamp_ms(data, "sourceTimestampMs") 
+                        flink_sent_timestamp_ms = parse_timestamp_ms(data, "flinkSentTimestampMs")
                         muscle_name = data.get("muscle")
                         value_uV_str = data.get("value")
 
-                        if not all([thingid, timestamp_ms is not None, muscle_name, value_uV_str is not None]):
-                            logger.warning(f"Skipping record with missing fields: {data}")
+                        if not all([thingid, source_timestamp_ms is not None, 
+                                    flink_sent_timestamp_ms is not None, 
+                                    muscle_name, value_uV_str is not None]):
+                            logger.warning(f"Skipping record with missing core fields: {data}")
                             continue
                         
                         if muscle_name not in MUSCLES_TO_MONITOR_FOR_MDF:
+                            logger.debug(f"Skipping muscle {muscle_name} not in MDF monitor list.")
                             continue
 
                         try:
                             value_uV = float(value_uV_str)
                             if np.isnan(value_uV) or np.isinf(value_uV): continue
-                        except (ValueError, TypeError): continue
+                        except (ValueError, TypeError): 
+                            logger.warning(f"Could not convert EMG value '{value_uV_str}' to float for {thingid}-{muscle_name}")
+                            continue
                         
                         key = (thingid, muscle_name)
-                        emg_sample_buffer[key].append(value_uV)
+                        emg_sample_buffer[key].append((source_timestamp_ms, flink_sent_timestamp_ms, value_uV))
 
                         if len(emg_sample_buffer[key]) == NPERSEG_WELCH:
-                            signal_segment = np.array(list(emg_sample_buffer[key]))
+                            current_fft_window_data_tuples = list(emg_sample_buffer[key])
+                            signal_segment = np.array([item[2] for item in current_fft_window_data_tuples]) 
+
+                            source_timestamps_in_fft_window = [item[0] for item in current_fft_window_data_tuples]
+                            flink_sent_timestamps_in_fft_window = [item[1] for item in current_fft_window_data_tuples]
+                            
+                            mdf_calc_source_timestamp_ms = source_timestamps_in_fft_window[-1] 
+                            avg_source_ts_for_this_fft_window = statistics.mean(source_timestamps_in_fft_window) if source_timestamps_in_fft_window else mdf_calc_source_timestamp_ms
+                            avg_flink_sent_ts_for_this_fft_window = statistics.mean(flink_sent_timestamps_in_fft_window) if flink_sent_timestamps_in_fft_window else flink_sent_timestamp_ms
 
                             if APPLY_PRE_FILTERING:
                                 signal_segment = butter_bandpass_filter(signal_segment, LOWCUT_HZ, HIGHCUT_HZ, SAMPLING_RATE_HZ)
@@ -200,98 +205,124 @@ def process_emg_mdf_fatigue():
                                                          nperseg=NPERSEG_WELCH, noverlap=NOVERLAP_WELCH, scaling='density')
                             except Exception as e:
                                 logger.error(f"Error in Welch for key {key}: {e}", exc_info=True)
-                                continue # Skip this MDF calculation
+                                continue 
 
                             mdf = calculate_mdf_from_psd(frequencies, psd)
 
                             if not np.isnan(mdf):
-                                # Timestamp for this MDF value is the timestamp of the *last* sample in the window
-                                mdf_calc_timestamp_ms = timestamp_ms 
-                                logger.debug(f"MDF Calculated: Key={key}, MDF_Time={datetime.datetime.fromtimestamp(mdf_calc_timestamp_ms/1000.0)}, MDF={mdf:.2f} Hz")
-                                mdf_history[key].append((mdf_calc_timestamp_ms, mdf))
+                                logger.debug(f"MDF Calculated: Key={key}, MDF_Src_Time={datetime.datetime.fromtimestamp(mdf_calc_source_timestamp_ms/1000.0)}, MDF={mdf:.2f} Hz")
+                                
+                                mdf_history[key].append((mdf_calc_source_timestamp_ms, mdf, avg_flink_sent_ts_for_this_fft_window, avg_source_ts_for_this_fft_window))
+                                
+                                # --- SEND INDIVIDUAL MDF VALUE FOR VISUALIZATION ---
+                                mdf_viz_payload = {
+                                    "thingId": thingid,
+                                    "muscle": muscle_name,
+                                    "sourceTimestampMs": mdf_calc_source_timestamp_ms, # Timestamp of this MDF point
+                                    "mdfValue": round(mdf, 2),
+                                    # Optional: include avg Flink sent time for data in this MDF's window
+                                    "avgFlinkSentTimestampForWindowDataMs": round(avg_flink_sent_ts_for_this_fft_window),
+                                    "avgSourceTimestampForWindowDataMs": round(avg_source_ts_for_this_fft_window)
+                                }
+                                try:
+                                    producer.send(MDF_VISUALIZATION_TOPIC, value=mdf_viz_payload)
+                                    # producer.flush() # Flush frequently if near real-time viz is critical and volume is low
+                                except Exception as e_prod_viz:
+                                    logger.error(f"Error sending MDF to visualization topic for {key}: {e_prod_viz}")
+                                # --- END SEND INDIVIDUAL MDF VALUE ---
 
-                                # Prune old MDF history based on the current MDF calculation time
-                                trend_window_start_ts = mdf_calc_timestamp_ms - (TREND_WINDOW_SEC * 1000)
+                                trend_window_start_ts = mdf_calc_source_timestamp_ms - (TREND_WINDOW_SEC * 1000)
                                 while mdf_history[key] and mdf_history[key][0][0] < trend_window_start_ts:
                                     mdf_history[key].popleft()
                                 
-                                current_sys_time_sec = time.time()
-                                if current_sys_time_sec < last_alert_time_mdf.get(key, 0) + ALERT_COOLDOWN_SEC:
+                                current_sys_time_s_py = time.time() 
+                                if current_sys_time_s_py < last_alert_time_mdf.get(key, 0) + ALERT_COOLDOWN_SEC:
                                     logger.debug(f"Key {key}: In MDF alert cooldown period.")
                                     continue
 
                                 if len(mdf_history[key]) >= MIN_MDF_POINTS_FOR_TREND:
-                                    history_points = list(mdf_history[key])
-                                    first_mdf_ts_in_history = history_points[0][0]
+                                    history_points_for_trend = list(mdf_history[key])
+                                    first_mdf_source_ts_in_trend = history_points_for_trend[0][0]
                                     
-                                    # Relative time for regression (in seconds)
-                                    times_rel_sec = np.array([(ts - first_mdf_ts_in_history) / 1000.0 for ts, _ in history_points])
-                                    mdfs_hist_values = np.array([mdf_val for _, mdf_val in history_points])
+                                    times_rel_sec_trend = np.array([(item[0] - first_mdf_source_ts_in_trend) / 1000.0 for item in history_points_for_trend])
+                                    mdfs_values_trend = np.array([item[1] for item in history_points_for_trend])
+                                    
+                                    # For overall delay calculation for the alert
+                                    source_timestamps_of_mdf_data_in_trend = [item[3] for item in history_points_for_trend] # avg_source_ts_for_fft_window
+                                    flink_sent_timestamps_of_mdf_data_in_trend = [item[2] for item in history_points_for_trend] # avg_flink_sent_ts_for_fft_window
 
-                                    if len(times_rel_sec) < 2: continue
+
+                                    if len(times_rel_sec_trend) < 2: continue
 
                                     try:
-                                        slope, intercept, r_value, p_value, std_err = linregress(times_rel_sec, mdfs_hist_values)
+                                        slope, intercept, r_value, p_value, std_err = linregress(times_rel_sec_trend, mdfs_values_trend)
                                         if np.isnan(slope) or np.isnan(r_value):
                                              logger.warning(f"Linreg resulted in NaN for key {key}. Slope={slope}, R={r_value}")
                                              continue
                                         r_squared = r_value**2
 
-                                        logger.info(f"MDF Trend: Key={key}, Slope={slope:.4f} Hz/s, R^2={r_squared:.3f}, Points={len(times_rel_sec)}")
+                                        logger.info(f"MDF Trend: Key={key}, Slope={slope:.4f} Hz/s, R^2={r_squared:.3f}, Points={len(mdfs_values_trend)}")
 
                                         if slope < MDF_SLOPE_FATIGUE_THRESHOLD and r_squared >= REGRESSION_R_SQUARED_THRESHOLD:
-                                            logger.warning(f"PYTHON MDF FATIGUE ALERT: Key={key} | Slope: {slope:.3f}, R^2: {r_squared:.3f}")
+                                            python_alert_emission_time_ms = int(time.time() * 1000) 
                                             
+                                            alert_trigger_timestamp_py = mdf_calc_source_timestamp_ms 
+                                            
+                                            avg_source_ts_of_data_in_trend_overall = statistics.mean(source_timestamps_of_mdf_data_in_trend) if source_timestamps_of_mdf_data_in_trend else alert_trigger_timestamp_py
+                                            avg_mdf_data_age_in_trend_ms_py = int(alert_trigger_timestamp_py - avg_source_ts_of_data_in_trend_overall)
+                                            
+                                            avg_flink_sent_ts_for_trend_mds_overall = statistics.mean(flink_sent_timestamps_of_mdf_data_in_trend) if flink_sent_timestamps_of_mdf_data_in_trend else 0
+                                            flink_pipeline_delay_for_trend_data_ms = 0
+                                            if avg_flink_sent_ts_for_trend_mds_overall > 0 and avg_source_ts_of_data_in_trend_overall > 0:
+                                                flink_pipeline_delay_for_trend_data_ms = int(avg_flink_sent_ts_for_trend_mds_overall - avg_source_ts_of_data_in_trend_overall)
+                                            
+                                            python_internal_processing_delay_ms = python_alert_emission_time_ms - alert_trigger_timestamp_py
+
                                             alert_payload = {
                                                 "thingId": thingid,
-                                                "alertTriggerTimestamp": mdf_calc_timestamp_ms,
-                                                "feedbackType": "emgMdfFatigueAlert", # Differentiate from RMS
+                                                "alertTriggerTimestamp": alert_trigger_timestamp_py,
+                                                "feedbackType": "emgMdfFatigueAlert", 
                                                 "muscle": muscle_name,
-                                                "severity": "HIGH",
-                                                "reason": "Decreasing MDF Trend Detected",
+                                                "severity": "HIGH", 
+                                                "reason": "Decreasing MDF Trend Detected (Python)",
                                                 "mdfSlopeHzPerSec": round(slope, 4),
                                                 "regressionRSquared": round(r_squared, 3),
-                                                "trendWindowSecondsUsed": int(round((mdf_calc_timestamp_ms - first_mdf_ts_in_history) / 1000.0)),
+                                                "trendWindowSecondsUsed": int(round((mdf_calc_source_timestamp_ms - first_mdf_source_ts_in_trend) / 1000.0)),
                                                 "numberOfMdfPointsInTrend": len(mdf_history[key]),
                                                 "mdfSlopeThreshold": MDF_SLOPE_FATIGUE_THRESHOLD,
                                                 "rSquaredThreshold": REGRESSION_R_SQUARED_THRESHOLD,
-                                                "lastMdfValue": round(mdfs_hist_values[-1], 2)
+                                                "lastMdfValue": round(mdfs_values_trend[-1], 2),
+                                                "averageMdfDataAgeInTrendMs": avg_mdf_data_age_in_trend_ms_py,
+                                                "estimatedFlinkPipelineDelayMs": flink_pipeline_delay_for_trend_data_ms,
+                                                "pythonProcessingTimeForAlertMs": python_internal_processing_delay_ms,
+                                                "pythonAlertSentTimestampMs": python_alert_emission_time_ms
                                             }
                                             producer.send(FATIGUE_ALERT_TOPIC, value=alert_payload)
-                                            producer.flush()
-                                            logger.info(f"Sent MDF fatigue alert for {key} to {FATIGUE_ALERT_TOPIC}")
-                                            last_alert_time_mdf[key] = current_sys_time_sec
-                                            # mdf_history[key].clear() # Optional: Reset trend after alert
+                                            producer.flush() 
+                                            logger.warning(f"PYTHON MDF FATIGUE ALERT SENT: Key={key} | Alert: {json.dumps(alert_payload)}")
+                                            last_alert_time_mdf[key] = current_sys_time_s_py
                                     except ValueError as ve:
-                                         logger.warning(f"Linreg failed for key {key}: {ve}. Data points: {len(times_rel_sec)}")
-                                    except Exception as ex:
-                                        logger.error(f"Error in trend analysis for {key}: {ex}", exc_info=True)
-                            # After processing, shift buffer for next Welch segment if using overlap
-                            # If NPERSEG is 100 and NOVERLAP is 50, we want to keep last 50 samples for next window.
-                            # This is implicitly handled by how we extract 'signal_segment' if emg_sample_buffer
-                            # continuously gets data. However, for strict Welch, we'd process fixed blocks.
-                            # The current emg_sample_buffer with maxlen=NPERSEG_WELCH means each MDF
-                            # is from a distinct (tumbling) window of raw samples.
-                            # If you want overlapping Welch segments from a continuous stream, the buffer logic needs to be more complex
-                            # or you pass larger chunks to a function that internally does the overlapping segmentation for Welch.
-                            # For simplicity here, this calculates MDF on NPERSEG_WELCH samples when that many *new* samples for that muscle arrive.
-
+                                         logger.warning(f"Linreg failed for key {key}: {ve}. Data points: {len(times_rel_sec_trend)}")
+                                    except Exception as ex_trend:
+                                        logger.error(f"Error in trend analysis for key {key}: {ex_trend}", exc_info=True)
                     except json.JSONDecodeError:
                         logger.warning(f"Could not decode JSON from record value: {record.value}")
-                    except Exception as e:
-                        logger.error(f"General error processing record for MDF: {e}", exc_info=True)
-
+                    except Exception as e_record:
+                        logger.error(f"General error processing record for MDF: {e_record}", exc_info=True)
     except KeyboardInterrupt:
         logger.info("MDF Processor: Shutdown signal received.")
-    except Exception as e:
-        logger.critical(f"MDF Processor: Critical error in main loop: {e}", exc_info=True)
+    except Exception as e_main_loop:
+        logger.critical(f"MDF Processor: Critical error in main loop: {e_main_loop}", exc_info=True)
     finally:
         logger.info("MDF Processor: Closing Kafka clients.")
-        if consumer: consumer.close(autocommit=False) # autocommit=False for graceful exit
+        if consumer: 
+            try: consumer.close(autocommit=False)
+            except Exception as e_con_close: logger.error(f"Error closing consumer: {e_con_close}")
         if producer:
-            try: producer.flush(timeout=10)
-            except Exception as e: logger.error(f"MDF Processor: Error flushing Kafka producer: {e}")
-            producer.close(timeout=10)
+            try: 
+                producer.flush(timeout=5) 
+                producer.close(timeout=5)
+            except Exception as e_prod_close: logger.error(f"Error closing producer: {e_prod_close}")
         logger.info("MDF Processor: Clients closed. Exiting.")
 
 if __name__ == "__main__":
