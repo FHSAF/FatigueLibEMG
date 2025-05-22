@@ -1,7 +1,7 @@
-# File: db_writer.py
 import psycopg2 # PostgreSQL adapter for Python
 import logging
 import datetime
+# import numpy as np # Not strictly needed here, but good if you were to register adapters
 
 logger = logging.getLogger(__name__)
 
@@ -65,8 +65,6 @@ def save_mdf_value_to_db(thingid: str, muscle_name: str, timestamp_ms: int, mdf_
         logger.error("Cannot save MDF to DB: No database connection.")
         return False
 
-    # Convert epoch milliseconds to a timezone-aware datetime string for PostgreSQL
-    # TimescaleDB TIMESTAMPTZ typically expects 'YYYY-MM-DD HH:MM:SS.MS+/-TZ'
     try:
         dt_object = datetime.datetime.fromtimestamp(timestamp_ms / 1000.0, tz=datetime.timezone.utc)
         sql_timestamp_str = dt_object.isoformat()
@@ -78,11 +76,13 @@ def save_mdf_value_to_db(thingid: str, muscle_name: str, timestamp_ms: int, mdf_
         INSERT INTO {MDF_TABLE_NAME} (time, thingid, muscle_name, mdf_value)
         VALUES (%s, %s, %s, %s)
         ON CONFLICT (time, thingid, muscle_name) DO NOTHING;
-    """ # ON CONFLICT assumes time, thingid, muscle_name is your primary key or unique constraint
+    """
 
     try:
-        cursor.execute(sql, (sql_timestamp_str, thingid, muscle_name, mdf_value))
-        # logger.debug(f"Saved MDF to DB: {thingid}, {muscle_name}, {sql_timestamp_str}, {mdf_value}")
+        python_native_float_mdf_value = float(mdf_value)
+
+        cursor.execute(sql, (sql_timestamp_str, thingid, muscle_name, python_native_float_mdf_value))
+        # logger.debug(f"Saved MDF to DB: {thingid}, {muscle_name}, {sql_timestamp_str}, {python_native_float_mdf_value}")
         return True
     except psycopg2.Error as e:
         logger.error(f"Error inserting MDF value into DB: {e}")
