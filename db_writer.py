@@ -1,37 +1,51 @@
-import psycopg2 # PostgreSQL adapter for Python
+# db_writer.py
+import psycopg2
 import logging
 import datetime
-# import numpy as np # Not strictly needed here, but good if you were to register adapters
+# from config import DB_HOST, DB_PORT, DB_NAME, DB_USER, DB_PASSWORD, MDF_TABLE_NAME
+# Note: To make db_writer.py truly standalone or testable without importing main app's config,
+# you might pass DB params to functions or initialize a DBManager class.
+# For this structure, we'll assume it can access config if run in the same context,
+# or we modify it to take params. Let's opt for passing config for better modularity.
 
 logger = logging.getLogger(__name__)
 
-# --- TimescaleDB Configuration (Consider moving to a shared config file or environment variables) ---
-DB_HOST = "192.168.50.208"  # e.g., 192.168.50.208
-DB_PORT = "5432"                         # Default PostgreSQL port
-DB_NAME = "th_emg_processed_db"          # Database where your MDF table resides
-DB_USER = "postgres"                 # e.g., postgres
-DB_PASSWORD = "postgres"         # e.g., postgres
-MDF_TABLE_NAME = "th_emg_mdf_values"     # The new table you'll create for MDF values
-
-# Global connection object (can be managed more robustly, e.g., with a connection pool)
 _connection = None
 _cursor = None
+
+# Store DB config globally within this module, set by an init function
+_DB_CONFIG = {}
+
+def init_db_config(host, port, dbname, user, password, mdf_table_name):
+    """Initializes DB configuration for this module."""
+    global _DB_CONFIG
+    _DB_CONFIG['host'] = host
+    _DB_CONFIG['port'] = port
+    _DB_CONFIG['dbname'] = dbname
+    _DB_CONFIG['user'] = user
+    _DB_CONFIG['password'] = password
+    _DB_CONFIG['mdf_table_name'] = mdf_table_name
+    logger.info("db_writer configuration initialized.")
 
 def _get_db_connection():
     """Establishes or reuses a database connection."""
     global _connection, _cursor
+    if not _DB_CONFIG:
+        logger.error("DB configuration not initialized. Call init_db_config() first.")
+        return None, None
+
     if _connection is None or _connection.closed != 0:
         try:
             _connection = psycopg2.connect(
-                host=DB_HOST,
-                port=DB_PORT,
-                dbname=DB_NAME,
-                user=DB_USER,
-                password=DB_PASSWORD
+                host=_DB_CONFIG['host'],
+                port=_DB_CONFIG['port'],
+                dbname=_DB_CONFIG['dbname'],
+                user=_DB_CONFIG['user'],
+                password=_DB_CONFIG['password']
             )
             _connection.autocommit = True # Or manage transactions explicitly
             _cursor = _connection.cursor()
-            logger.info(f"Successfully connected to TimescaleDB: {DB_NAME}")
+            logger.info(f"Successfully connected to TimescaleDB: {_DB_CONFIG['dbname']}")
         except psycopg2.Error as e:
             logger.error(f"Error connecting to TimescaleDB: {e}")
             _connection = None
@@ -53,16 +67,10 @@ def close_db_connection():
 def save_mdf_value_to_db(thingid: str, muscle_name: str, timestamp_ms: int, mdf_value: float):
     """
     Saves a single MDF value to the TimescaleDB.
-    Assumes a table 'th_emg_mdf_values' exists with columns:
-    time TIMESTAMPTZ NOT NULL,
-    thingid TEXT NOT NULL,
-    muscle_name TEXT NOT NULL,
-    mdf_value DOUBLE PRECISION NOT NULL,
-    PRIMARY KEY (time, thingid, muscle_name)
     """
     connection, cursor = _get_db_connection()
     if not connection or not cursor:
-        logger.error("Cannot save MDF to DB: No database connection.")
+        logger.error("Cannot save MDF to DB: No database connection or DB config not set.")
         return False
 
     try:
@@ -73,21 +81,20 @@ def save_mdf_value_to_db(thingid: str, muscle_name: str, timestamp_ms: int, mdf_
         return False
 
     sql = f"""
-        INSERT INTO {MDF_TABLE_NAME} (time, thingid, muscle_name, mdf_value)
+        INSERT INTO {_DB_CONFIG['mdf_table_name']} (time, thingid, muscle_name, mdf_value)
         VALUES (%s, %s, %s, %s)
         ON CONFLICT (time, thingid, muscle_name) DO NOTHING;
     """
 
     try:
+        # Ensure mdf_value is a standard Python float for psycopg2
         python_native_float_mdf_value = float(mdf_value)
-
         cursor.execute(sql, (sql_timestamp_str, thingid, muscle_name, python_native_float_mdf_value))
-        # logger.debug(f"Saved MDF to DB: {thingid}, {muscle_name}, {sql_timestamp_str}, {python_native_float_mdf_value}")
+        logger.debug(f"Saved MDF to DB: {thingid}, {muscle_name}, {sql_timestamp_str}, {python_native_float_mdf_value}")
         return True
     except psycopg2.Error as e:
         logger.error(f"Error inserting MDF value into DB: {e}")
-        # Consider reconnecting if it's a connection error
-        if "connection" in str(e).lower():
+        if "connection" in str(e).lower() or "closed" in str(e).lower():
              global _connection # Signal to re-establish connection on next call
              _connection = None
         return False
