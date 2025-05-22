@@ -9,6 +9,7 @@ import logging
 import datetime
 import threading # For potential future scalability if needed
 import statistics # For mean calculation
+from db_writer import save_mdf_value_to_db, close_db_connection
 
 # --- Configuration ---
 KAFKA_BROKERS = ['192.168.50.105:9092', '192.168.50.105:9093', '192.168.50.105:9094']
@@ -231,6 +232,8 @@ def process_emg_mdf_fatigue():
                                     logger.error(f"Error sending MDF to visualization topic for {key}: {e_prod_viz}")
                                 # --- END SEND INDIVIDUAL MDF VALUE ---
 
+                                save_mdf_value_to_db(thingid, muscle_name, mdf_calc_source_timestamp_ms, round(mdf, 4)) # Using more precision for DB
+
                                 trend_window_start_ts = mdf_calc_source_timestamp_ms - (TREND_WINDOW_SEC * 1000)
                                 while mdf_history[key] and mdf_history[key][0][0] < trend_window_start_ts:
                                     mdf_history[key].popleft()
@@ -314,7 +317,7 @@ def process_emg_mdf_fatigue():
     except Exception as e_main_loop:
         logger.critical(f"MDF Processor: Critical error in main loop: {e_main_loop}", exc_info=True)
     finally:
-        logger.info("MDF Processor: Closing Kafka clients.")
+        logger.info("MDF Processor: Closing Kafka clients and DB connection.")
         if consumer: 
             try: consumer.close(autocommit=False)
             except Exception as e_con_close: logger.error(f"Error closing consumer: {e_con_close}")
@@ -323,7 +326,8 @@ def process_emg_mdf_fatigue():
                 producer.flush(timeout=5) 
                 producer.close(timeout=5)
             except Exception as e_prod_close: logger.error(f"Error closing producer: {e_prod_close}")
-        logger.info("MDF Processor: Clients closed. Exiting.")
+        close_db_connection() # NEW: Close DB connection on exit
+        logger.info("MDF Processor: Clients and DB connection closed. Exiting.")
 
 if __name__ == "__main__":
     process_emg_mdf_fatigue()
