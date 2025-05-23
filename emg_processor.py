@@ -13,7 +13,7 @@ from concurrent.futures import ThreadPoolExecutor
 
 # Import configurations and modules
 import config
-import db_writer
+# import db_writer
 from fatigue_analyser import perform_fatigue_analysis_and_alert
 
 # --- Setup Logger ---
@@ -137,10 +137,10 @@ def main_processing_loop():
         logger.critical("Failed to initialize Kafka clients. Exiting.")
         return
 
-    db_writer.init_db_config(
-        config.DB_HOST, config.DB_PORT, config.DB_NAME,
-        config.DB_USER, config.DB_PASSWORD, config.MDF_TABLE_NAME
-    )
+    # db_writer.init_db_config(
+    #     config.DB_HOST, config.DB_PORT, config.DB_NAME,
+    #     config.DB_USER, config.DB_PASSWORD, config.MDF_TABLE_NAME
+    # )
 
     fatigue_analysis_executor = ThreadPoolExecutor(
         max_workers=config.FATIGUE_ANALYSIS_WORKERS,
@@ -222,20 +222,20 @@ def main_processing_loop():
                                 mdf_history[key].append((mdf_calc_source_timestamp_ms, mdf, avg_flink_sent_ts_for_this_fft_window, avg_source_ts_for_this_fft_window))
 
                                 # Send to visualization topic (main thread)
-                                # mdf_viz_payload = {
-                                #     "thingId": thingid, "muscle": muscle_name,
-                                #     "sourceTimestampMs": mdf_calc_source_timestamp_ms,
-                                #     "mdfValue": round(mdf, 2),
-                                #     "avgFlinkSentTimestampForWindowDataMs": round(avg_flink_sent_ts_for_this_fft_window),
-                                #     "avgSourceTimestampForWindowDataMs": round(avg_source_ts_for_this_fft_window)
-                                # }
-                                # try:
-                                #     kafka_producer.send(config.MDF_VISUALIZATION_TOPIC, value=mdf_viz_payload)
-                                # except Exception as e_prod_viz:
-                                #     logger.error(f"Error sending MDF to visualization topic for {key}: {e_prod_viz}", exc_info=True)
+                                mdf_viz_payload = {
+                                    "thingId": thingid, "muscle": muscle_name,
+                                    "sourceTimestampMs": mdf_calc_source_timestamp_ms,
+                                    "mdfValue": round(mdf, 4),
+                                    "avgFlinkSentTimestampForWindowDataMs": round(avg_flink_sent_ts_for_this_fft_window),
+                                    "avgSourceTimestampForWindowDataMs": round(avg_source_ts_for_this_fft_window)
+                                }
+                                try:
+                                    kafka_producer.send(config.MDF_VISUALIZATION_TOPIC, value=mdf_viz_payload)
+                                except Exception as e_prod_viz:
+                                    logger.error(f"Error sending MDF to visualization topic for {key}: {e_prod_viz}", exc_info=True)
 
                                 # Save MDF value to database (main thread)
-                                db_writer.save_mdf_value_to_db(thingid, muscle_name, mdf_calc_source_timestamp_ms, round(mdf, 4))
+                                # db_writer.save_mdf_value_to_db(thingid, muscle_name, mdf_calc_source_timestamp_ms, round(mdf, 4))
 
                                 # Prune old mdf_history (main thread)
                                 trend_window_start_ts = mdf_calc_source_timestamp_ms - (config.TREND_WINDOW_SEC * 1000)
@@ -301,7 +301,7 @@ def shutdown_gracefully():
         except Exception as e_prod_close:
             logger.error(f"Error closing Kafka producer: {e_prod_close}", exc_info=True)
 
-    db_writer.close_db_connection()
+    # db_writer.close_db_connection()
     logger.info("MDF Processor: Shutdown complete. Exiting.")
 
 
